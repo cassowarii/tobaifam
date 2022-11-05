@@ -251,7 +251,7 @@ async def join(ctx):
     elif not game.active:
         game.players.append(ctx.author)
         await ctx.send(
-            f"{ctx.author.mention} joined {game.name}.\n **Now playing ({len(game.players)}):**"
+            f"{ctx.author.mention} joined {game.name}.\n **Now playing ({len(game.players)}):** "
             + ", ".join([p.name for p in game.players])
         )
         if len(game.players) >= 3:
@@ -485,6 +485,7 @@ async def timer_routine(ctx, length):
 
 def cancel_timer():
     if game.timer > 0:
+        game.timer = 0
         game.stop_timer = True
 
 
