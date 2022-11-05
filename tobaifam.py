@@ -94,6 +94,22 @@ async def on_message(msg):
 
     await bot.process_commands(msg)
 
+# Normal system message function
+async def system_message(ctx, msg, emoji=None, altmsgs=None):
+    if emoji is None:
+        emoji = ''
+    else:
+        emoji = ':%s: ' % emoji
+
+    if altmsgs is None or random.randint(0, 2):
+        await ctx.send("***-- %s%s --***" % (emoji, msg))
+    else:
+        await ctx.send("***-- %s%s --***" % (emoji, altmsgs[random.randint(0, len(altmsgs) - 1)]))
+
+# Error message function
+async def yell_at_user(ctx, msg):
+    await ctx.send(ctx.author.mention + ' :warning: `%s`' % msg)
+
 @bot.command(brief='Create a game as the manual host')
 async def host(ctx, *, game_name=None):
     global game
@@ -221,7 +237,8 @@ async def timer(ctx, arg):
                 'TWILIGHT': "Twilight phase",
                 'NIGHT': "Night",
             }
-            await system_message(ctx, ":hourglass: %s will end %s." % (phase_text[game.phase], time_phrase))
+            await system_message(ctx, "%s will end %s." % (phase_text[game.phase], time_phrase), 'hourglass')
+
             try:
                 await timer_routine(ctx, time_amt)
             except Alarm as a:
@@ -292,7 +309,17 @@ async def vote(ctx, *, arg=None):
         else:
             await yell_at_user(ctx, "It's not time to vote right now!")
 
-@bot.command(brief="Cast a vote during a game's voting phase")
+@bot.command(brief="Abstain during a game's voting phase")
+async def abstain(ctx):
+    if await require_game_active(ctx) and await require_player(ctx):
+        if game.phase == 'VOTE':
+            await cast_vote(ctx, Abstain)
+        elif game.phase == 'DAY':
+            await yell_at_user(ctx, "Please wait until the end of the day to cast your vote!")
+        else:
+            await yell_at_user(ctx, "It's not time to vote right now!")
+
+@bot.command(brief="Eliminate a player manually as the host")
 async def kill(ctx, *, arg=None):
     if await require_game_active(ctx) and await require_host(ctx):
         if arg is None:
@@ -304,30 +331,9 @@ async def kill(ctx, *, arg=None):
             except ValueError as e:
                 await yell_at_user(ctx, e.args[0])
 
-@bot.command(brief="Abstain during a game's voting phase")
-async def abstain(ctx):
-    if await require_game_active(ctx) and await require_player(ctx):
-        if game.phase == 'VOTE':
-            await cast_vote(ctx, Abstain)
-        elif game.phase == 'DAY':
-            await yell_at_user(ctx, "Please wait until the end of the day to cast your vote!")
-        else:
-            await yell_at_user(ctx, "It's not time to vote right now!")
-
 @bot.command(brief='Test functionality')
 async def ping(ctx):
     await ctx.send(ctx.author.mention + ' pong')
-
-async def system_message(ctx, msg, emoji=None, altmsgs=None):
-    if emoji is None:
-        emoji = ''
-    else:
-        emoji = ':%s: ' % emoji
-
-    if altmsgs is None or random.randint(0, 2):
-        await ctx.send("***-- %s%s --***" % (emoji, msg))
-    else:
-        await ctx.send("***-- %s%s --***" % (emoji, altmsgs[random.randint(0, len(altmsgs) - 1)]))
 
 async def timer_routine(ctx, length):
     game.timer = length
@@ -378,7 +384,7 @@ async def enter_day_phase(ctx, arg):
         game.day += 1
         game.phase = 'DAY'
         cancel_timer()
-        await system_message(ctx, ":sunny: DAY %d BEGINS" % game.day)
+        await system_message(ctx, "DAY %d BEGINS" % game.day, 'sunny')
         await ctx.send("**Alive (%d):** %s" % (len(game.players), ", ".join([ p.mention for p in game.players ])))
     elif game.phase == 'TWILIGHT':
         await yell_at_user(ctx, "Please wait for the night to start before trying to end the night")
@@ -387,7 +393,7 @@ async def enter_day_phase(ctx, arg):
         # can use this to extend day after calling an =vote
         cancel_timer()
         game.phase = 'DAY'
-        await system_message(ctx, ':sunny: DAY %d***, um, ***CONTINUES' % game.day)
+        await system_message(ctx, 'DAY %d***, um, ***CONTINUES' % game.day, 'sunny')
 
     if arg is None:
         await ctx.send("(:information_source: **" + game.host.display_name + "**, you can type:\n"
@@ -435,14 +441,12 @@ async def enter_night_phase(ctx):
         # undo starting the day
         game.day -= 1
         game.phase = 'NIGHT'
-        #cancel_timer() TODO implement 'cancel timer' on phase change
         await system_message(ctx, "...***uh, ***GOING BACK TO NIGHT %d" % game.day, 'first_quarter_moon_with_face')
     elif game.phase == 'VOTE':
         await yell_at_user(ctx, "Voting is not complete yet! Type '" + cmd_prefix + "timer 0' to end voting phase and resolve the elimination first.")
     elif game.phase == 'TWILIGHT':
         cancel_timer()
         game.phase = 'NIGHT'
-        #cancel_timer()
         await system_message(ctx, 'NIGHT %d BEGINS' % game.day, 'first_quarter_moon_with_face')
 
         if game.day == 0:
@@ -547,8 +551,5 @@ async def require_game_active(ctx):
     else:
         await yell_at_user(ctx, "There's no game in progress!")
         return False
-
-async def yell_at_user(ctx, msg):
-    await ctx.send(ctx.author.mention + ' :warning: `%s`' % msg)
 
 bot.run(access_token)
