@@ -1,339 +1,462 @@
+"""Host of everyone's favorite murder simulator"""
+# pylint:disable=missing-function-docstring
+import asyncio
+import functools
+import os
 import random
 import re
-import asyncio
-import os
 
 import discord
 from discord.ext import commands
 
-access_token = os.environ["ACCESS_TOKEN"]
+import mafia
+import messages
+from mafia import Abstain, Alarm
+from messages import system_message, yell_at_user
 
+CMD_PREFIX = "="
+
+DISCORD_API_TOKEN_VAR = "ACCESS_TOKEN"
+
+# Declare our bot and API intents
+# TODO: drive TWILIGHT vote via menu/reactions to avoid needing message_content
 di = discord.Intents.default()
 di.message_content = True
+bot = commands.Bot(command_prefix=CMD_PREFIX, intents=di)
 
-cmd_prefix = '='
-
-bot = commands.Bot(command_prefix=cmd_prefix, intents=di)
-
+#
+# Global state - TODO: move into an object when we make this reentrant
+#
+game = None
+game_active = False
 hosts = []
 players = {}
 
-Abstain = object()
 
-class Alarm(Exception):
-    pass
+#
+# Assertion helpers
+# TODO: relocate to game abstraction
+#
+def is_host(user):
+    return game and game.active and game.host == user
 
-class Game:
-    def __init__(self, name, host):
-        self.active = False
-        self.name = name
-        self.host = host
-        self.players = []
-        self.dead = []
-        self.votes = {}
-        self.phase = None
-        self.day = 0
-        self.timer = 0
-        self.stop_timer = False
 
-    def find_user(self, string):
-        string = string.strip()
-        if m := re.match("^\<\@(\d+)\>$", string):
-            uid = int(m.group(1))
-            matching_players = [ p for p in self.players if p.id == uid ]
-            if len(matching_players) == 0:
-                raise ValueError("That person isn't playing the game right now! Please don't ping them :(")
-            elif len(matching_players) == 1:
-                return matching_players[0]
+def is_player(user):
+    return game and game.active and user in game.players
+
+
+def is_signup_host(user):
+    return game and not game.active and game.host == user
+
+
+def is_signup_player(user):
+    return game and not game.active and user in game.players
+
+
+#
+# Decorator-style command assertions - must be placed AFTER the @bot.command decorator
+# All of these assume the first arg to the command is the ctx.
+#
+# More general assertions should sit higher on the list than more specific assertions.
+#
+# TODO: possibly relocate to game abstraction? or own file
+#
+# Example:
+# >>> @bot.command(brief="Example command")
+# >>> @require_game_active()
+# >>> @require_host()
+# >>> def example(ctx):
+# ...     pass
+#
+def require_host(yell_msg="You must be host to use this command."):
+    def _decorator(func):
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            ctx = args[0]
+            if not is_host(ctx.author):
+                await yell_at_user(ctx, yell_msg)
             else:
-                raise ValueError("I'm sorry, but Discord appears to be possessed by a ghost.")
-        else:
-            users_starting_with_name = [ p for p in self.players
-                    if ("%s#%s" % (p.name.lower(), p.discriminator)).find(string.lower()) > -1
-                                        or p.display_name.lower().find(string.lower()) > -1 ]
-            if len(users_starting_with_name) == 0:
-                raise ValueError("Can't find user whose name contains '%s'" % string)
-            elif len(users_starting_with_name) == 1:
-                return users_starting_with_name[0]
+                return await func(*args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+def require_signup_host(yell_msg="You must be the host of the current signing-up game to use this command."):
+    def _decorator(func):
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            ctx = args[0]
+            if not is_signup_host(ctx.author):
+                await yell_at_user(ctx, yell_msg)
             else:
-                raise ValueError("I don't know who you mean by '%s' (could be %s)"
-                                 % (string, ", ".join([ "%s#%s" % (p.name, p.discriminator) for p in users_starting_with_name ])))
+                return await func(*args, **kwargs)
 
-    def votes_for(self, user):
-        return len([ v for v in self.votes.values() if v == user ])
+        return _wrapper
 
-    def total_votes(self):
-        return len(self.votes)
+    return _decorator
 
-NORMAL_ALARM_TEXT = "DING DING DING"
-NORMAL_VOTING_TEXT = "Time to vote!"
 
-START_MSGS = [ 'START!', 'スタート！', '*commencer !*', '`COMIENZA EL JUEGO`', '开始。︀', '*~begin~*', '**COMMENCE**', "***So... it begins.***", "*And away we go.*", "Here it comes...!", "IT BEGINS", "Let the games.......... *begin!*" ]
-ALARM_TONES = [ "BEEP BEEP!", "That's all, folks", "The end!!!", "Whoa nelly!", "It's over...", "...That's it. I'm callin' it...", "It's the end of an era!", "Ding dong! `Oh, someone's at the door...`", "womp womp", "DING DING D- oh sorry, is that annoying?", "BEEP BOOP END OF LINE", "The End~!", "It's all over for you, buddy...", "BEEP BEEP", "DING DONG", "Dingadang dong dang doo", "That's enough now!", "Dang dang... Sorry, I'm still new at this." ]
-VOTING_TONES = [ "Count those votes!", "Aw yeah, it's votin' time!", "Let's Voting Today!", "Everybody Votes Channel!", "Cast those votes, buckaroo!", "Let's all vote for who we want to get rid of!", "Don't forget to vote for who you don't like!", "Let's do a vote!", "It's time for everyone to vote...", "Voting time is boating time!", "Let's all vote together!", "Cast those ballots!", "I liked when he said \"it's voting time\" and then he voted all over the place", "Vote 'em up, cowboy" ]
-VOTING_END_TONES = [ "The votes are in!!!", "it's over!!!!!!", "Thank you for participating in our democracy!", "I do believe this represents the sum total of votes that shall be counted in this elimination election. Indubitably.", "Thanks for voting!", "STOP VOTING", "the end (of voting)", "OK we're good now you can stop casting votes", "guys that's enough votes", "Let's see what the ~~cat~~ vote dragged in", "Shall we see what the results were?", "Who's being voted off the island?" ]
+def require_player(yell_msg="You must be a player to use this command."):
+    def _decorator(func):
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            ctx = args[0]
+            if not is_player(ctx.author):
+                await yell_at_user(ctx, yell_msg)
+            else:
+                return await func(*args, **kwargs)
 
-# Global state, to be moved into an object when we make this reentrant
-game = None
+        return _wrapper
 
-game_active = False
+    return _decorator
+
+
+def require_signup_player(yell_msg="You must be signed up for a game to use this command."):
+    def _decorator(func):
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            ctx = args[0]
+            if not is_signup_player(ctx.author):
+                await yell_at_user(ctx, yell_msg)
+            else:
+                return await func(*args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+def require_not_in_game(yell_msg="You're already part of the game!"):
+    def _decorator(func):
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            ctx = args[0]
+            if any(
+                [is_host(ctx.author), is_player(ctx.author), is_signup_host(ctx.author), is_signup_player(ctx.author)]
+            ):
+                await yell_at_user(ctx, yell_msg)
+            else:
+                return await func(*args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+def require_game_not_active(yell_msg="There's already a game in progress!"):
+    def _decorator(func):
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            ctx = args[0]
+            if game is not None and game.active:
+                await yell_at_user(ctx, yell_msg)
+            else:
+                return await func(*args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+def require_game_active(yell_msg="There's no game in progress!"):
+    def _decorator(func):
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            ctx = args[0]
+            if game is None or not game.active:
+                await yell_at_user(ctx, yell_msg)
+            else:
+                return await func(*args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+def require_game_phase(phase, yell_msg="Now's not the time to do that!"):
+    def _decorator(func):
+        @functools.wraps(func)
+        async def _wrapper(*args, **kwargs):
+            ctx = args[0]
+            if game is None or game.phase != phase:
+                await yell_at_user(ctx, yell_msg)
+            else:
+                return await func(*args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+#
+# Commands
+#
+
 
 @bot.event
 async def on_ready():
     print(f"--- {bot.user.name} has connected ---")
 
+
 @bot.event
 async def on_message(msg):
     # During voting phase, delete any messages that don't start with =vote
-    if game and game.phase == 'VOTE':
-        if msg.author != game.host and msg.author != bot.user:
-            if not msg.content.startswith(cmd_prefix + 'vote') and not msg.content.startswith(cmd_prefix + 'abstain'):
+    if game and game.phase == game.Phase.VOTE:
+        if msg.author not in (game.host, bot.user):
+            if not msg.content.startswith(f"{CMD_PREFIX}vote") and not msg.content.startswith(f"{CMD_PREFIX}abstain"):
                 await msg.delete()
-                await msg.channel.send(msg.author.mention + " You may only type `" + cmd_prefix + "vote [someone]` or `" + cmd_prefix + "abstain` at this time.")
+                await msg.channel.send(
+                    msg.author.mention
+                    + f"You may only type `{CMD_PREFIX}vote [someone]` or `{CMD_PREFIX}abstain` at this time."
+                )
                 return
-
     await bot.process_commands(msg)
 
-# Normal system message function
-async def system_message(ctx, msg, emoji=None, altmsgs=None):
-    if emoji is None:
-        emoji = ''
-    else:
-        emoji = ':%s: ' % emoji
 
-    if altmsgs is None or random.randint(0, 2):
-        await ctx.send("***-- %s%s --***" % (emoji, msg))
-    else:
-        await ctx.send("***-- %s%s --***" % (emoji, altmsgs[random.randint(0, len(altmsgs) - 1)]))
-
-# Error message function
-async def yell_at_user(ctx, msg):
-    await ctx.send(ctx.author.mention + ' :warning: `%s`' % msg)
-
-@bot.command(brief='Create a game as the manual host')
+@bot.command(brief="Create a game as the manual host")
+@require_game_not_active()
+@require_not_in_game()
 async def host(ctx, *, game_name=None):
     global game
+    if game is None:
+        default_name = False
+        if game_name is None:
+            default_name = True
+            game_name = ctx.author.display_name + "'s game"
 
-    if await require_game_not_active(ctx) and await require_not_in_game(ctx):
-        if game is None:
-            default_name = False
-            if game_name is None:
-                default_name = True
-                game_name = ctx.author.display_name + "'s game"
+        # name, host, players, votes
+        game = mafia.Game(game_name, ctx.author)
 
-            # name, host, players, votes
-            game = Game(game_name, ctx.author)
-
-            if default_name:
-                await ctx.send("Game created!!!! :slight_smile:")
-            else:
-                await ctx.send("Created %s!!!! :slight_smile:" % game.name)
-            await ctx.send("Players, type `" + cmd_prefix + "join` to sign up for this game.\n"
-                               + "(:information_source: **" + game.host.display_name + "**, as the host, type `"
-                               + cmd_prefix + "cancel` to cancel the signups.)")
+        if default_name:
+            await ctx.send("Game created!!!! :slight_smile:")
         else:
-            await yell_at_user(ctx, game.host.mention + " is already recruiting players for a game.`")
+            await ctx.send(f"Created {game.name}!!!! :slight_smile:")
+        await ctx.send(
+            f"Players, type `{CMD_PREFIX}join` to sign up for this game.\n"
+            + f"(:information_source: **{game.host.display_name}** as the host, type `{CMD_PREFIX}cancel`"
+            + "to cancel the signups.)"
+        )
+    else:
+        await yell_at_user(ctx, f"{game.host.display_name} is already recruiting players for a game.")
 
-@bot.command(brief='Sign up for a game')
+
+@bot.command(brief="Sign up for a game")
+@require_game_not_active()
 async def join(ctx):
-    if await require_game_not_active(ctx):
-        if game is None:
-            await yell_at_user(ctx, "No one is seeking players for a game right now :-(")
-            await ctx.send("(If you want to start a new game where you're the host, type `" + cmd_prefix + "host` to create a new game.)")
-        elif not game.active:
-            game.players.append(ctx.author)
-            await ctx.send(ctx.author.mention + " joined " + game.name + ".\n"
-                                + "**Now in the game (" + str(len(game.players)) + ")**: "
-                                   + ", ".join([str(p) for p in game.players]))
-            if len(game.players) >= 3:
-                await ctx.send("(" + game.host.mention + ", as the host, you can start the game by typing `" + cmd_prefix + "start`.)")
+    if game is None:
+        await yell_at_user(ctx, "No one is seeking players for a game right now :-(")
+        await ctx.send(f"(If you want to start a new game as the host, type `{CMD_PREFIX}host` to create a new game.)")
+    elif not game.active:
+        game.players.append(ctx.author)
+        await ctx.send(
+            f"{ctx.author.mention} joined {game.name}.\n **Now playing ({len(game.players)}):**"
+            + ", ".join([p.name for p in game.players])
+        )
+        if len(game.players) >= 3:
+            await ctx.send(f"({game.host.mention}, as the host, you can start the game by typing `{CMD_PREFIX}start`.)")
 
-@bot.command(brief='Un-sign-up for a game')
+
+@bot.command(brief="Un-sign-up for a game")
+@require_game_not_active()
+@require_signup_player()
 async def unjoin(ctx):
-    if await require_game_not_active(ctx) and await require_signup_player(ctx):
-        if game is None:
-            await yell_at_user(ctx, "There's no game to leave right now!")
-        else:
-            game.players = [ p for p in game.players if p != ctx.author ]
-            await ctx.send(ctx.author.mention + " left the game.\n"
-                               + "**Now in the game (" + str(len(game.players)) + ")**: "
-                                   + ", ".join(game.players))
+    if game is None:
+        await yell_at_user(ctx, "There's no game to leave right now!")
+    else:
+        game.players = [p for p in game.players if p != ctx.author]
+        await ctx.send(
+            f"{ctx.author.mention} left the game.\n **Now playing ({len(game.players)}):**"
+            + ", ".join([p.name for p in game.players])
+        )
 
-@bot.command(brief='Cancel game during signups')
+
+@bot.command(brief="Cancel game during signups")
+@require_game_not_active()
+@require_signup_host()  # TODO: allow anyone (not just host) to cancel a game after like some amount of time idk
 async def cancel(ctx):
-    # TODO ::: allow anyone (not just host) to cancel a game after like some amount of time idk
     global game
-    if await require_game_not_active(ctx) and await require_signup_host(ctx):
-        game = None
-        await ctx.send("Game cancelled. :crying_cat_face:")
+    game = None
+    await ctx.send("Game cancelled. :crying_cat_face:")
 
-@bot.command(brief='Start game when you are the host')
+
+@bot.command(brief="Start game when you are the host")
+@require_game_not_active()
+@require_signup_host()
 async def start(ctx):
-    if await require_game_not_active(ctx) and await require_signup_host(ctx):
-        if len(game.players) < 3:
-            await yell_at_user(ctx, "You need at least three players for a Mafia game!")
-            return
-        game.active = True
-        game.day = 0
-        game.phase = 'TWILIGHT'
-        await ctx.send(" ".join(p.mention for p in game.players)+ " : The game is starting!\n")
+    if len(game.players) < 3:
+        await yell_at_user(ctx, "You need at least three players for a Mafia game!")
+        return
+    game.active = True
+    game.day = 0
+    game.phase = game.Phase.TWILIGHT
+    await ctx.send(" ".join(p.mention for p in game.players) + " : The game is starting!\n")
 
-        # Count down
-        for i in range(3, 0, -1):
-            await asyncio.sleep(0.5)
-            await ctx.send("%d..." % i)
-
-        # Print game-starting stuff
+    # Count down
+    for i in range(3, 0, -1):
         await asyncio.sleep(0.5)
-        await system_message(ctx, game.name)
-        await asyncio.sleep(0.2)
-        await ctx.send(START_MSGS[random.randint(0, len(START_MSGS) - 1)])
-        await enter_night_phase(ctx)
+        await ctx.send(f"{i}...")
 
-@bot.command(brief='Set a timer to end a particular phase')
+    # Print game-starting stuff
+    await asyncio.sleep(0.5)
+    await system_message(ctx, game.name)
+    await asyncio.sleep(0.2)
+    await ctx.send(random.choice(messages.START_MSGS))
+    await enter_night_phase(ctx)
+
+
+@bot.command(brief="Set a timer to end a particular phase")
+@require_game_active()
+@require_host()
 async def timer(ctx, arg):
-    if await require_game_active(ctx) and await require_host(ctx):
-        # Cancel any existing timer
-        cancel_timer()
+    # Cancel any existing timer
+    cancel_timer()
 
-        # Parse time expression (if no units supplied, we assume minutes)
-        time_amt = None
-        if m := re.match(r"^([\d\.]+) *mi?n?u?t?e?s?$", arg):
-            time_amt = float(m.group(1)) * 60
-        elif m := re.match(r"^([\d]+) *s?e?c?o?n?d?s?$", arg):
-            time_amt = float(m.group(1))
-        elif m := re.match(r"^([\d]+)$", arg):
-            time_amt = float(m.group(1)) * 60
+    # Parse time expression (if no units supplied, we assume minutes)
+    time_amt = None
+    if m := re.match(r"^([\d\.]+) *mi?n?u?t?e?s?$", arg):
+        time_amt = float(m.group(1)) * 60
+    elif m := re.match(r"^([\d]+) *s?e?c?o?n?d?s?$", arg):
+        time_amt = float(m.group(1))
+    elif m := re.match(r"^([\d]+)$", arg):
+        time_amt = float(m.group(1)) * 60
 
-        if time_amt is not None:
-            mins = time_amt // 60
-            secs = int(time_amt) % 60
+    if time_amt is not None:
+        mins = time_amt // 60
+        secs = int(time_amt) % 60
 
-            # phrase time stuff
-            # e.g. "Day is ending in 5 minutes and 48 seconds"
-            time_phrase = "in "
+        # phrase time stuff
+        # e.g. "Day is ending in 5 minutes and 48 seconds"
+        time_phrase = "in "
 
-            if mins != 0:
-                if mins == 1:
-                    time_phrase += "1 minute"
-                else:
-                    time_phrase += "%d minutes" % mins
+        if mins != 0:
+            if mins == 1:
+                time_phrase += "1 minute"
+            else:
+                time_phrase += f"{mins} minutes"
 
-            if mins != 0 and secs != 0:
-                time_phrase += " and "
+        if mins != 0 and secs != 0:
+            time_phrase += " and "
 
-            if secs != 0:
-                if secs == 1:
-                    time_phrase += "1 second"
-                else:
-                    time_phrase += "%d seconds" % secs
+        if secs != 0:
+            if secs == 1:
+                time_phrase += "1 second"
+            else:
+                time_phrase += f"{secs} seconds"
 
-            if mins == 0 and secs == 0:
-                time_phrase = "NOW"
+        if mins == 0 and secs == 0:
+            time_phrase = "NOW"
 
-            phase_text = {
-                'DAY': "Day",
-                'VOTE': "Voting phase",
-                'TWILIGHT': "Twilight phase",
-                'NIGHT': "Night",
-            }
-            await system_message(ctx, "%s will end %s." % (phase_text[game.phase], time_phrase), 'hourglass')
+        await system_message(ctx, f"{game.phase.value} will end {time_phrase}.", "hourglass")
 
-            try:
-                await timer_routine(ctx, time_amt)
-            except Alarm as a:
-                # Timer got cancelled early -- so abort!
-                await ctx.send(a.args[0])
-                return
+        try:
+            await timer_routine(ctx, time_amt)
+        except Alarm as a:
+            # Timer got cancelled early -- so abort!
+            await ctx.send(a.args[0])
+            return
 
-            # Once timer finishes, move to the next phase of gameplay
-            if game.phase == 'DAY':
-                await enter_voting_phase(ctx)
-            elif game.phase == 'VOTE':
-                await enter_twilight_phase(ctx)
-            elif game.phase == 'TWILIGHT':
-                await enter_night_phase(ctx)
-            elif game.phase == 'NIGHT':
-                await enter_day_phase(ctx, None)
-        else:
-            await yell_at_user(ctx, "Unknown time format. :( Please specify something like '5m' or '30s'.")
+        # Once timer finishes, move to the next phase of gameplay
+        if game.phase == game.Phase.DAY:
+            await enter_voting_phase(ctx)
+        elif game.phase == game.Phase.VOTE:
+            await enter_twilight_phase(ctx)
+        elif game.phase == game.Phase.TWILIGHT:
+            await enter_night_phase(ctx)
+        elif game.phase == game.Phase.NIGHT:
+            await enter_day_phase(ctx, None)
+    else:
+        await yell_at_user(
+            ctx,
+            "Unknown time format. :( Please specify something like '5m' or '30s'.",
+        )
+
 
 async def cast_vote(ctx, voted_user):
     game.votes[ctx.author] = voted_user
 
     if voted_user is Abstain:
-        name = 'Abstain'
-        ping = 'Abstain'
+        name = "Abstain"
+        mention = "Abstain"
     else:
         name = voted_user.display_name
-        ping = voted_user.mention
+        mention = voted_user.mention
 
     majority_count = len(game.players) // 2 + 1
-    vote_status = "(%d votes for %s, %d needed for majority)" % (game.votes_for(voted_user), name, majority_count)
-    await ctx.send("%s votes for %s... %s" % (ctx.author.mention, ping, vote_status))
+    await ctx.send(
+        f"{ctx.author.mention} votes for {mention}! "
+        + f"({game.votes_for(voted_user)} votes for {name}, {majority_count} needed for majority)"
+    )
 
     if game.votes_for(voted_user) >= majority_count:
         if voted_user is Abstain:
-            await system_message(ctx, "The town votes to abstain!", 'neutral_face', [
-                "How could you do this to poor Abstain?!", "Abstain will be eliminated", "Abstain carries the day...",
-                "The Abstains have it!", "The town chickens out!", "And they all lived happily ever after"
-            ])
+            await system_message(
+                ctx,
+                "The town votes to abstain!",
+                "neutral_face",
+                messages.VOTE_ABSTAIN_RESPONSES,
+            )
         else:
-            await system_message(ctx, "Majority reached!", 'open_mouth', [
-                "%s is condemned..." % voted_user.display_name, "A TRIBUTE HAS BEEN CHOSEN", "A decision has been reached...",
-                "It's all over for %s..." % voted_user.display_name, "NO MORE VOTES NECESSARY", "MAJORITY!!"
-            ])
+            await system_message(
+                ctx,
+                "Majority reached!",
+                "open_mouth",
+                messages.VOTE_MAJORITY_RESPONSES,
+            )
         await enter_twilight_phase(ctx)
 
     elif game.total_votes() == len(game.players):
-        await system_message(ctx, "Everyone voted, but no majority was reached!", 'slight_frown', [
-            "It's a hung jury!", "~Split Decision~", "Couldn't choose just one, huh?", "The town votes for... no one.",
-            "Everybody lives, Rose!", "The town failed to reach a decision.", "Whoops, you didn't pick anyone!"
-        ])
+        await system_message(
+            ctx,
+            "Everyone voted, but no majority was reached!",
+            "slight_frown",
+            messages.VOTE_NO_DECISION_RESPONSES,
+        )
         await enter_twilight_phase(ctx)
 
+
 @bot.command(brief="Cast a vote during a game's voting phase")
+@require_game_active()
+@require_player()
+@require_game_phase(mafia.Game.Phase.VOTE, yell_msg="Please wait until the end of the day to cast your vote!")
 async def vote(ctx, *, arg=None):
-    if await require_game_active(ctx) and await require_player(ctx):
-        if game.phase == 'VOTE':
-            if arg is None:
-                await yell_at_user(ctx, "Who are you voting for???")
-            else:
-                try:
-                    voted_user = game.find_user(arg)
-                    await cast_vote(ctx, voted_user)
-                except ValueError as e:
-                    await yell_at_user(ctx, e.args[0])
-        elif game.phase == 'DAY':
-            await yell_at_user(ctx, "Please wait until the end of the day to cast your vote!")
-        else:
-            await yell_at_user(ctx, "It's not time to vote right now!")
+    if arg is None:
+        await yell_at_user(ctx, "Who are you voting for???")
+    else:
+        try:
+            voted_user = game.find_user(arg)
+            await cast_vote(ctx, voted_user)
+        except ValueError as e:
+            await yell_at_user(ctx, e.args[0])
+
 
 @bot.command(brief="Abstain during a game's voting phase")
+@require_game_active()
+@require_player()
+@require_game_phase(mafia.Game.Phase.VOTE, yell_msg="Please wait until the end of the day to cast your vote!")
 async def abstain(ctx):
-    if await require_game_active(ctx) and await require_player(ctx):
-        if game.phase == 'VOTE':
-            await cast_vote(ctx, Abstain)
-        elif game.phase == 'DAY':
-            await yell_at_user(ctx, "Please wait until the end of the day to cast your vote!")
-        else:
-            await yell_at_user(ctx, "It's not time to vote right now!")
+    await cast_vote(ctx, Abstain)
+
 
 @bot.command(brief="Eliminate a player manually as the host")
+@require_game_active()
+@require_host()
 async def kill(ctx, *, arg=None):
-    if await require_game_active(ctx) and await require_host(ctx):
-        if arg is None:
-            await yell_at_user(ctx, "Who do you want to eliminate?")
-        else:
-            try:
-                eliminated_user = game.find_user(arg)
-                await eliminate_player(ctx, eliminated_user)
-            except ValueError as e:
-                await yell_at_user(ctx, e.args[0])
+    if arg is None:
+        await yell_at_user(ctx, "Who do you want to eliminate?")
+    else:
+        try:
+            eliminated_user = game.find_user(arg)
+            await eliminate_player(ctx, eliminated_user)
+        except ValueError as e:
+            await yell_at_user(ctx, e.args[0])
 
-@bot.command(brief='Test functionality')
+
+@bot.command(brief="Test functionality")
 async def ping(ctx):
-    await ctx.send(ctx.author.mention + ' pong')
+    await ctx.send(ctx.author.mention + " pong")
+
 
 async def timer_routine(ctx, length):
     game.timer = length
@@ -342,13 +465,12 @@ async def timer_routine(ctx, length):
         if game.stop_timer:
             game.stop_timer = False
             raise Alarm("*(stopped previous timer)*")
-            return
         game.timer -= 1
         if game.timer == 0:
-            #await system_message(ctx, NORMAL_ALARM_TEXT, 'bell', ALARM_TONES)
+            # await system_message(ctx, NORMAL_ALARM_TEXT, 'bell', ALARM_TONES)
             pass
         elif game.timer % 120 == 0:
-            await system_message(ctx, "%d minutes left" % (timer // 60))
+            await system_message(ctx, f"{timer // 60} minutes left")
         elif game.timer == 60:
             await system_message(ctx, "One minute left")
         elif game.timer == 30:
@@ -360,72 +482,81 @@ async def timer_routine(ctx, length):
         elif game.timer <= 5:
             await system_message(ctx, str(int(game.timer)))
 
+
 def cancel_timer():
     if game.timer > 0:
         game.stop_timer = True
 
+
 async def enter_voting_phase(ctx, say_nothing=False):
     cancel_timer()
-    game.phase = 'VOTE'
+    game.phase = game.Phase.VOTE
     if not say_nothing:
         game.votes = {}
-        await system_message(ctx, NORMAL_VOTING_TEXT, 'pencil2', VOTING_TONES)
-        await ctx.send("Type something like `" + cmd_prefix + "vote " + game.host.display_name + "` to vote for another user. "
-                       + "(You can also ping whoever you're voting for after the `" + cmd_prefix + "vote` command.)\n"
-                     + "You can also type `" + cmd_prefix + "abstain` to cast a vote for no one.\n"
-                     + "Voting phase ends when everyone has cast a vote, or when a majority is reached.\n"
-                       + "(:information_source: **" + game.host.display_name + "**, you can type `" + cmd_prefix
-                       + "timer [time limit]` to place a time limit on voting, or `"
-                       + cmd_prefix + "day` to extend the day phase more.)")
+        await system_message(ctx, messages.NORMAL_VOTING_TEXT, "pencil2", messages.VOTING_TONES)
+        await ctx.send(
+            f"Type something like `{CMD_PREFIX}vote {game.host.display_name}`to vote for another user. "
+            + f"(You can also ping whoever you're voting for after the `{CMD_PREFIX}vote` command.)\n"
+            + f"You can also type `{CMD_PREFIX}abstain` to cast a vote for no one.\n"
+            + "Voting phase ends when everyone has cast a vote, or when a majority is reached.\n"
+            + f"(:information_source: **{game.host.display_name}**, you can type `{CMD_PREFIX}timer [time limit]` "
+            + f"to place a time limit on voting, or `{CMD_PREFIX}day` to extend the day phase more.)"
+        )
+
 
 async def enter_day_phase(ctx, arg):
-    if game.phase == 'NIGHT':
+    if game.phase == game.Phase.NIGHT:
         cancel_timer()
         game.day += 1
-        game.phase = 'DAY'
+        game.phase = game.Phase.DAY
         cancel_timer()
-        await system_message(ctx, "DAY %d BEGINS" % game.day, 'sunny')
-        await ctx.send("**Alive (%d):** %s" % (len(game.players), ", ".join([ p.mention for p in game.players ])))
-    elif game.phase == 'TWILIGHT':
+        await system_message(ctx, f"DAY {game.day} BEGINS", "sunny")
+        await ctx.send(f"**Alive ({len(game.players)}):** {', '.join([p.mention for p in game.players])}")
+    elif game.phase == game.Phase.TWILIGHT:
         await yell_at_user(ctx, "Please wait for the night to start before trying to end the night")
         return
     else:
         # can use this to extend day after calling an =vote
         cancel_timer()
-        game.phase = 'DAY'
-        await system_message(ctx, 'DAY %d***, um, ***CONTINUES' % game.day, 'sunny')
+        game.phase = game.Phase.DAY
+        await system_message(ctx, f"DAY {game.day}***, um, ***CONTINUES", "sunny")
 
     if arg is None:
-        await ctx.send("(:information_source: **" + game.host.display_name + "**, you can type:\n"
-                + "- `" + cmd_prefix + "timer X` to move to voting phase in X amount of time (X could be `5m`, `30s`, etc)\n"
-                + "- `" + cmd_prefix + "votingphase` to immediately end the day and move to voting phase.)\n")
+        await ctx.send(
+            f"(:information_source: **{game.host.display_name}**, you can type:\n"
+            + f"- `{CMD_PREFIX}timer X` to move to voting phase in X amount of time (X could be `5m`, `30s`, etc)\n"
+            + f"- `{CMD_PREFIX}votingphase` to immediately end the day and move to voting phase.)\n"
+        )
     else:
         await timer(ctx, arg)
 
+
 async def enter_twilight_phase(ctx):
-    if game.phase == 'VOTE':
+    if game.phase == game.Phase.VOTE:
         cancel_timer()
-        game.phase = 'TWILIGHT'
+        game.phase = game.Phase.TWILIGHT
         # RESOLVE VOTES
         # Calculate who got eliminated
 
         majority_count = len(game.players) // 2 + 1
         eliminated = None
 
-        voting_results_msg = "With **%d** players alive, a majority decision required **%d** votes.\n" % (len(game.players), majority_count)
+        voting_results_msg = (
+            f"With **{len(game.players)}** players alive, a majority decision requires **{majority_count}** votes.\n"
+        )
         for u in game.players:
             vote_count = game.votes_for(u)
             if vote_count > 0:
-                voting_results_msg += ("**%s (%d)**: %s\n"
-                   % (u.display_name, vote_count, ", ".join([ p.display_name for p in game.votes.keys() if game.votes[p] == u ])))
+                voters = [p.display_name for p, v in game.votes.items() if v == u]
+                voting_results_msg += f"**{u.display_name} ({vote_count})**: {', '.join(voters)}\n"
             if vote_count >= majority_count:
                 eliminated = u
 
         if game.votes_for(Abstain) > 0:
-            voting_results_msg += ("**Abstain (%d)**: %s\n"
-                % (game.votes_for(Abstain), ", ".join([ p.display_name for p in game.votes.keys() if game.votes[p] == Abstain ])))
+            voters = [p.display_name for p, v in game.votes.items() if v == Abstain]
+            voting_results_msg += f"**Abstain ({game.votes_for(Abstain)})**: {', '.join(voters)}\n"
 
-        await system_message(ctx, "RESULTS", 'ballot_box', VOTING_END_TONES)
+        await system_message(ctx, "RESULTS", "ballot_box", messages.VOTING_END_TONES)
         await ctx.send(voting_results_msg)
 
         if eliminated is not None:
@@ -433,123 +564,90 @@ async def enter_twilight_phase(ctx):
         else:
             await ctx.send("No one is eliminated.")
 
-        await ctx.send("(:information_source: **" + game.host.display_name + "**, say your piece, then type `" + cmd_prefix + "night` to move to night phase.)")
+        await ctx.send(
+            f"(:information_source: **{game.host.display_name}**, say your piece, then type `{CMD_PREFIX}night`"
+            + "to move to night phase.)"
+        )
+
 
 async def enter_night_phase(ctx):
-    if game.phase == 'DAY':
+    if game.phase == game.Phase.DAY:
         cancel_timer()
         # undo starting the day
         game.day -= 1
-        game.phase = 'NIGHT'
-        await system_message(ctx, "...***uh, ***GOING BACK TO NIGHT %d" % game.day, 'first_quarter_moon_with_face')
-    elif game.phase == 'VOTE':
-        await yell_at_user(ctx, "Voting is not complete yet! Type '" + cmd_prefix + "timer 0' to end voting phase and resolve the elimination first.")
-    elif game.phase == 'TWILIGHT':
+        game.phase = game.Phase.NIGHT
+        await system_message(ctx, f"...***uh, ***GOING BACK TO NIGHT {game.day}", "first_quarter_moon_with_face")
+    elif game.phase == game.Phase.VOTE:
+        await yell_at_user(
+            ctx,
+            f"Voting is not over yet! Type '{CMD_PREFIX}timer 0` to end voting and resolve the elimination first.",
+        )
+    elif game.phase == game.Phase.TWILIGHT:
         cancel_timer()
-        game.phase = 'NIGHT'
-        await system_message(ctx, 'NIGHT %d BEGINS' % game.day, 'first_quarter_moon_with_face')
+        game.phase = game.Phase.NIGHT
+        await system_message(ctx, f"NIGHT {game.day} BEGINS", "first_quarter_moon_with_face")
 
         if game.day == 0:
-            await ctx.send("(:information_source: **" + game.host.display_name + "**, do whatever you need to, then type `"
-                   + cmd_prefix + "day` when you're ready to start the first day. "
-                   + "You can also specify a time limit like `" + cmd_prefix + "day 5min`.)\n")
+            await ctx.send(
+                f"(:information_source: **{game.host.display_name}**, do whatever you need to, then type "
+                + f"`{CMD_PREFIX}day` to start the first day. You can also specify a time limit, like "
+                + f"`{CMD_PREFIX}day 5min`.)\n"
+            )
         else:
-            await ctx.send("(:information_source: **" + game.host.display_name + "**, you can type:\n"
-                    + "- `" + cmd_prefix + "timer X` to end the night in a certain amount of time\n"
-                    + "- `" + cmd_prefix + "day` to immediately end the night and move to the next day phase.)\n")
-    elif game.phase == 'NIGHT':
+            await ctx.send(
+                f"(:information_source: **{game.host.display_name}**, you can type:\n"
+                + f"- `{CMD_PREFIX}timer X` to end the night in a certain amount of time\n"
+                + f"- `{CMD_PREFIX}day` to immediately end the night and move to the next day phase.)\n"
+            )
+    elif game.phase == game.Phase.NIGHT:
         await yell_at_user(ctx, "Hey! It's already nighttime, you weirdo!")
 
-DEATH_EMOJIS = [ 'skull_crossbones', 'skull', 'bone', 'dizzy_face', 'ghost', 'zombie', 'vampire', 'coffin', 'headstone', 'dagger', 'bomb', 'knife', 'hole' ]
+
 async def eliminate_player(ctx, eliminated):
-    game.players = [ p for p in game.players if p != eliminated ]
+    game.players = [p for p in game.players if p != eliminated]
     game.dead.append(eliminated)
-    death_emoji = DEATH_EMOJIS[random.randint(0, len(DEATH_EMOJIS)-1)]
-    await ctx.send(":%s: %s has been eliminated. :%s:" % (death_emoji, eliminated.mention, death_emoji))
+    death_emoji = random.choice(messages.DEATH_EMOJIS)
+    await ctx.send(f":{death_emoji}: {eliminated.mention} has been eliminated. :{death_emoji}:")
 
-@bot.command(brief='Move to day phase in game')
+
+@bot.command(brief="Move to day phase in game")
+@require_game_active()
+@require_host()
 async def day(ctx, *, arg=None):
-    if await require_game_active(ctx) and await require_host(ctx):
-        await enter_day_phase(ctx, arg)
+    await enter_day_phase(ctx, arg)
 
-@bot.command(brief='Move to night phase in game')
+
+@bot.command(brief="Move to night phase in game")
+@require_game_active()
+@require_host()
 async def night(ctx):
-    if await require_game_active(ctx) and await require_host(ctx):
-        await enter_night_phase(ctx)
+    await enter_night_phase(ctx)
 
-@bot.command(brief='Move to voting phase in game')
+
+@bot.command(brief="Move to voting phase in game")
+@require_game_active()
+@require_host()
 async def votingphase(ctx):
-    if await require_game_active(ctx) and await require_host(ctx):
-        if game.phase == 'DAY':
-            await enter_voting_phase(ctx)
-        elif game.phase == 'VOTE':
-            yell_at_user(ctx, "It's already the voting phase, what are you doing?")
-        elif game.phase == 'TWILIGHT':
-            system_message(ctx, "NEVER MIND, CONTINUE VOTING")
-            await enter_voting_phase(ctx, say_nothing=True)
-        elif game.phase == 'NIGHT':
-            await yell_at_user(ctx, "Voting already ended for the day!")
+    if game.phase == game.Phase.DAY:
+        await enter_voting_phase(ctx)
+    elif game.phase == game.Phase.VOTE:
+        yell_at_user(ctx, "It's already the voting phase, what are you doing?")
+    elif game.phase == game.Phase.TWILIGHT:
+        system_message(ctx, "NEVER MIND, CONTINUE VOTING")
+        await enter_voting_phase(ctx, say_nothing=True)
+    elif game.phase == game.Phase.NIGHT:
+        await yell_at_user(ctx, "Voting already ended for the day!")
 
-def is_host(user):
-    return game and game.active and game.host == user
 
-def is_player(user):
-    return game and game.active and user in game.players
+#
+# startup routine
+#
 
-def is_signup_host(user):
-    return game and not game.active and game.host == user
+if __name__ == "__main__":
 
-def is_signup_player(user):
-    return game and not game.active and user in game.players
-
-async def require_host(ctx):
-    if is_host(ctx.author):
-        return True
-    else:
-        await yell_at_user(ctx, "You must be host to use this command.")
-        return False
-
-async def require_signup_host(ctx):
-    if is_signup_host(ctx.author):
-        return True
-    else:
-        await yell_at_user(ctx, "You must be the host of the current signing-up game to use this command.")
-        return False
-
-async def require_player(ctx):
-    if is_player(ctx.author):
-        return True
-    else:
-        await yell_at_user(ctx, "You must be a player to use this command.")
-        return False
-
-async def require_signup_player(ctx):
-    if is_signup_player(ctx.author):
-        return True
-    else:
-        await yell_at_user(ctx, "You must be signed up for a game to use this command.")
-        return False
-
-async def require_not_in_game(ctx):
-    if (not is_host(ctx.author) and not is_player(ctx.author)
-            and not is_signup_host(ctx.author) and not is_signup_player(ctx.author)):
-        return True
-    else:
-        await yell_at_user(ctx, "You're already part of the game!")
-        return False
-
-async def require_game_not_active(ctx):
-    if not game or not game.active:
-        return True
-    else:
-        await yell_at_user(ctx, "There's already a game in progress!")
-        return False
-
-async def require_game_active(ctx):
-    if game and game.active:
-        return True
-    else:
-        await yell_at_user(ctx, "There's no game in progress!")
-        return False
-
-bot.run(access_token)
+    access_token = os.environ.get(DISCORD_API_TOKEN_VAR, None)
+    if access_token is None:
+        raise EnvironmentError(
+            f"{DISCORD_API_TOKEN_VAR} environment variable not set! Ensure you have a valid Discord API bot token!"
+        )
+    bot.run(access_token)

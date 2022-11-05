@@ -1,0 +1,11 @@
+
+[tool.black]
+line-length = 120
+
+[tool.isort]
+
+[tool.pylint]
+disable = [
+    "C0103",  # invalid-name
+]
+max-line-length = 120
